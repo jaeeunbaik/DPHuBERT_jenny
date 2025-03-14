@@ -2,6 +2,9 @@
 
 ![GitHub Repo stars](https://img.shields.io/github/stars/pyf98/DPHuBERT)
 
+- February 2025 **Conformer Module Added** by Jaeeun Baik
+
+
 This repo contains the code and models for our paper: 
 
 Yifan Peng, Yui Sudo, Shakeel Muhammad, and Shinji Watanabe, “DPHuBERT: Joint Distillation and Pruning of Self-Supervised Speech Models,” in Proc. INTERSPEECH, 2023.
