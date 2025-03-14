@@ -8,6 +8,7 @@ https://github.com/pytorch/audio/blob/main/torchaudio/models/wav2vec2/components
 from collections import defaultdict
 from typing import List, Optional, Tuple
 import math
+import copy
 
 import torch
 from torch import nn, Tensor
@@ -19,6 +20,8 @@ from .pruning_utils import (
     prune_conv1d_layer,
     prune_layer_norm,
 )
+from .resnet.conv1d_extractor import Conv1dResNet
+from .resnet.conv3d_extractor import Conv3dResNet
 
 
 def _init_transformer_params(module):
@@ -251,15 +254,23 @@ class FeatureProjection(Module):
         in_features: int,
         out_features: int,
         dropout: float,
+        modality: str = "audio",
     ):
         super().__init__()
-        self.layer_norm = nn.LayerNorm(in_features)
-        self.projection = nn.Linear(
-            in_features,
-            out_features,
-        )
+        self.modality = modality
+        if self.modality == "audio":
+            self.projection = nn.Linear(
+                in_features,
+                out_features,
+            )
+            self.layer_norm = nn.LayerNorm(in_features)
+        elif self.modality == "video":
+            self.projection = nn.Linear(
+                in_features*2,
+                out_features,
+            )
+            self.layer_norm = nn.LayerNorm(in_features*2)
         self.dropout = nn.Dropout(dropout)
-
     def forward(self, x):
         """
         Args:
@@ -268,6 +279,8 @@ class FeatureProjection(Module):
         Returns:
             Tensor: Projected features. ``[batch, frame, out_feature]``.
         """
+        if self.modality=="video":
+            x = torch.cat([x, x], dim=2)  # double the feature
         x = self.layer_norm(x)
         x = self.projection(x)
         x = self.dropout(x)
@@ -784,11 +797,438 @@ class FeedForward(Module):
             else:
                 prune_linear_layer(self.intermediate_dense, interm_index, "output")
 
-                self.output_dense.weight.data *= interm_mask
+                self.f2.weight.data *= interm_mask
                 prune_linear_layer(self.output_dense, interm_index, "input")
             self.hard_concrete_for_intermediate = None
 
         return new_config
+
+class Downsampler(Module):
+    """Layer that downsamples the input using Conv1d, LayerNorm, and GeLU, with residual connection."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int,
+        dropout: float,
+        prune_intermediate: bool = False,
+        prune_layer: bool = False,
+    ):
+        super().__init__()
+        self.conv1d = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride)
+        self.residual_proj = (
+            nn.Conv1d(in_channels, out_channels, kernel_size=1)
+            if in_channels != out_channels or stride != 1
+            else None
+        )
+        self.layer_norm = nn.LayerNorm(out_channels)
+        self.activation = torch.nn.functional.gelu
+        self.dropout = nn.Dropout(dropout)
+
+        if prune_intermediate:
+            self.hard_concrete_for_intermediate = HardConcrete(
+                n_in=out_channels, init_mean=0.5
+            )
+        else:
+            self.hard_concrete_for_intermediate = None
+        
+        if prune_layer:
+            self.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+        else:
+            self.hard_concrete_for_layer = None
+
+    def forward(self, x):
+        """
+        Args:
+            x (Tensor): shape: `(batch, sequence_length, in_channels)`
+        Returns:
+            x (Tensor): shape: `(batch, sequence_length // stride, out_channels)`
+        """
+        x_residual = x  # Save input for residual connection
+        x = x.transpose(1, 2)  # (batch, in_channels, sequence_length)
+        x = self.conv1d(x)  # (batch, out_channels, new_sequence_length)
+        
+        if self.residual_proj is not None:
+            x_residual = self.residual_proj(x_residual.transpose(1, 2))  # Project residual to match output shape
+        
+        x = x + x_residual  # Add residual connection
+        x = x.transpose(1, 2)  # (batch, new_sequence_length, out_channels)
+        x = self.layer_norm(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+
+        if self.hard_concrete_for_intermediate is not None:
+            intermediate_mask = self.hard_concrete_for_intermediate()  # (out_channels,)
+            x = x * intermediate_mask
+
+        if self.hard_concrete_for_layer is not None:
+            layer_mask = self.hard_concrete_for_layer()  # (1,)
+            x = x * layer_mask
+
+        return x
+
+    def get_num_params(self):
+        in_channels = self.conv1d.in_channels
+        out_channels = self.conv1d.out_channels
+        kernel_size = self.conv1d.kernel_size[0]
+        num_params = in_channels * out_channels * kernel_size + out_channels  # Conv1d params
+
+        if self.hard_concrete_for_intermediate is not None:
+            out_channels = self.hard_concrete_for_intermediate.l0_norm()
+            num_params = in_channels * out_channels * kernel_size + out_channels
+
+        if self.hard_concrete_for_layer is not None:
+            num_params *= self.hard_concrete_for_layer.l0_norm()
+
+        return num_params
+
+    def prune(self):
+        new_config = {
+            "use_downsampler": True,
+            "downsample_out_channels": self.conv1d.out_channels,
+        }
+
+        if self.hard_concrete_for_layer is not None:
+            assert not self.hard_concrete_for_layer.training
+            layer_mask = self.hard_concrete_for_layer()
+            self.conv1d.weight.data *= layer_mask
+            self.conv1d.bias.data *= layer_mask
+            if layer_mask == 0:
+                new_config["use_downsampler"] = False
+            self.hard_concrete_for_layer = None
+
+        if self.hard_concrete_for_intermediate is not None:
+            assert not self.hard_concrete_for_intermediate.training
+            interm_mask = self.hard_concrete_for_intermediate()
+            interm_index = interm_mask.nonzero().squeeze(-1)
+            new_config["downsample_out_channels"] = len(interm_index)
+            if new_config["downsample_out_channels"] == 0:
+                new_config["use_downsampler"] = False
+            else:
+                prune_conv1d_layer(self.conv1d, interm_index, "output")
+            self.hard_concrete_for_intermediate = None
+
+        return new_config
+    
+class Upsampler(Module):
+    """Layer that upsamples the input using ConvTranspose1d, LayerNorm, GeLU, and residual connection."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int,
+        dropout: float,
+        prune_intermediate: bool = False,
+        prune_layer: bool = False,
+    ):
+        super().__init__()
+        self.conv1d_transpose = nn.ConvTranspose1d(
+            in_channels, out_channels, kernel_size, stride=stride
+        )
+        self.residual_proj = (
+            nn.Conv1d(in_channels, out_channels, kernel_size=1)
+            if in_channels != out_channels
+            else None
+        )
+        self.layer_norm = nn.LayerNorm(out_channels)
+        self.activation = torch.nn.functional.gelu
+        self.dropout = nn.Dropout(dropout)
+
+        if prune_intermediate:
+            self.hard_concrete_for_intermediate = HardConcrete(
+                n_in=out_channels, init_mean=0.5
+            )
+        else:
+            self.hard_concrete_for_intermediate = None
+
+        if prune_layer:
+            self.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+        else:
+            self.hard_concrete_for_layer = None
+
+    def forward(self, x):
+        """
+        Args:
+            x (Tensor): shape: `(batch, sequence_length, in_channels)`
+        Returns:
+            x (Tensor): shape: `(batch, sequence_length * stride, out_channels)`
+        """
+        x_residual = x  # Save input for residual connection
+        x = x.transpose(1, 2)  # (batch, in_channels, sequence_length)
+        x = self.conv1d_transpose(x)  # (batch, out_channels, new_sequence_length)
+        
+        if self.residual_proj is not None:
+            # Residual projection: Match channels
+            x_residual = self.residual_proj(x_residual.transpose(1, 2))  # (batch, out_channels, sequence_length)
+            x_residual = torch.nn.functional.interpolate(
+                x_residual, size=x.size(-1), mode="nearest"
+            )  # Match sequence length
+        
+        x = x + x_residual  # Add residual connection
+        x = x.transpose(1, 2)  # (batch, new_sequence_length, out_channels)
+        x = self.layer_norm(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+
+        if self.hard_concrete_for_intermediate is not None:
+            intermediate_mask = self.hard_concrete_for_intermediate()  # (out_channels,)
+            x = x * intermediate_mask
+
+        if self.hard_concrete_for_layer is not None:
+            layer_mask = self.hard_concrete_for_layer()  # (1,)
+            x = x * layer_mask
+
+        return x
+  
+    def get_num_params(self):
+        in_channels = self.conv1d_transpose.in_channels
+        out_channels = self.conv1d_transpose.out_channels
+        kernel_size = self.conv1d_transpose.kernel_size[0]
+        num_params = in_channels * out_channels * kernel_size + out_channels  # ConvTranspose1d params
+
+        if self.hard_concrete_for_intermediate is not None:
+            out_channels = self.hard_concrete_for_intermediate.l0_norm()
+            num_params = in_channels * out_channels * kernel_size + out_channels
+
+        if self.hard_concrete_for_layer is not None:
+            num_params *= self.hard_concrete_for_layer.l0_norm()
+
+        return num_params
+
+    def prune(self):
+        new_config = {
+            "use_upsampler": True,
+            "upsample_out_channels": self.conv1d_transpose.out_channels,
+        }
+
+        if self.hard_concrete_for_layer is not None:
+            assert not self.hard_concrete_for_layer.training
+            layer_mask = self.hard_concrete_for_layer()
+            self.conv1d_transpose.weight.data *= layer_mask
+            self.conv1d_transpose.bias.data *= layer_mask
+            if layer_mask == 0:
+                new_config["use_upsampler"] = False
+            self.hard_concrete_for_layer = None
+
+        if self.hard_concrete_for_intermediate is not None:
+            assert not self.hard_concrete_for_intermediate.training
+            interm_mask = self.hard_concrete_for_intermediate()
+            interm_index = interm_mask.nonzero().squeeze(-1)
+            new_config["upsample_out_channels"] = len(interm_index)
+            if new_config["upsample_out_channels"] == 0:
+                new_config["use_upsampler"] = False
+            else:
+                prune_conv1d_layer(self.conv1d_transpose, interm_index, "output")
+            self.hard_concrete_for_intermediate = None
+
+        return new_config
+
+class ConvModule(Module):
+    """Convolution Module for Conformer Encoder Layer."""
+
+    def __init__(self, 
+                embed_dim: int, 
+                kernel_size: int = 31, 
+                dropout: float = 0.1, 
+                prune_layer: bool = False):
+        super(ConvModule, self).__init__()
+        self.pointwise_conv1 = nn.Conv1d(embed_dim, 2 * embed_dim, kernel_size=1)
+        self.glu = nn.GLU(dim=1)  # Gated Linear Unit
+        self.depthwise_conv = nn.Conv1d(
+            embed_dim,
+            embed_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=embed_dim,  # Depthwise Convolution
+        )
+        self.batch_norm = nn.BatchNorm1d(embed_dim)
+        self.swish = nn.SiLU()  # Swish Activation
+        self.pointwise_conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+        # Optional pruning
+        if prune_layer:
+            self.hard_concrete_for_layer = HardConcrete(n_in=1, init_mean=0.01)
+        else:
+            self.hard_concrete_for_layer = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (Tensor): Input tensor of shape `(batch, seq_len, embed_dim)`.
+        Returns:
+            Tensor: Output tensor of the same shape as input.
+        """
+        residual = x
+        x = x.transpose(1, 2)  # Convert to (batch, embed_dim, seq_len) for Conv1d
+        x = self.pointwise_conv1(x)
+        x = self.glu(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.swish(x)
+        x = self.pointwise_conv2(x)
+        x = self.dropout(x)
+        x = x.transpose(1, 2)  # Back to (batch, seq_len, embed_dim)
+
+        # Apply pruning if enabled
+        if self.hard_concrete_for_layer is not None:
+            layer_mask = self.hard_concrete_for_layer()  # Scalar or (1,)
+            x = x * layer_mask
+
+        x = self.layer_norm(residual + x)  # Residual Connection
+        return x
+
+    def get_num_params(self) -> int:
+        """Calculate the number of parameters in the ConvModule."""
+        num_params = 0
+        for module in [self.pointwise_conv1, self.depthwise_conv, self.pointwise_conv2]:
+            num_params += sum(p.numel() for p in module.parameters())
+        num_params += sum(p.numel() for p in self.batch_norm.parameters())
+
+        if self.hard_concrete_for_layer is not None:
+            num_params *= self.hard_concrete_for_layer.l0_norm()
+        
+        return num_params
+
+    def prune(self) -> dict:
+        """Prune convolutional filters based on learned hard concrete masks."""
+        new_config = {"use_conv": True}
+        if self.hard_concrete_for_layer is not None:
+            assert not self.hard_concrete_for_layer.training
+            layer_mask = self.hard_concrete_for_layer()  # Scalar or (1,)
+            if layer_mask == 0:
+                new_config["use_conv"] = False
+            else:
+                # Apply mask to the second pointwise convolution
+                self.pointwise_conv2.weight.data *= layer_mask
+                self.pointwise_conv2.bias.data *= layer_mask
+            self.hard_concrete_for_layer = None
+        return new_config
+
+
+class ConformerLayer(Module):
+    """A layer unit in encoder. Combines multihead self-attention, feed-forward, and convolution module."""
+
+    def __init__(
+        self,
+        attention: Optional[Module],    # Multihead Self-Attention
+        dropout: float,
+        layer_norm_first: bool,
+        feed_forward: Optional[Module], # Feed-Forward Network
+        conv_module: Optional[Module],  # Convolution Module
+        embed_dim: int,
+        normalize_before: bool,
+        concat_after: bool,
+        macaron_style: bool,
+    ):
+        super(ConformerLayer, self).__init__()
+        self.self_attn = attention
+        self.feed_forward = feed_forward
+        self.ff_scale = 1.0
+        self.conv_module = conv_module
+        self.macaron_style = macaron_style
+        self.norm_ff = nn.LayerNorm(embed_dim)
+        self.norm_mha = nn.LayerNorm(embed_dim)
+        self.layer_norm_first = layer_norm_first
+        if self.macaron_style:
+            self.feed_forward_macaron = copy.deepcopy(feed_forward)
+            self.ff_scale = 0.5
+            # for another FNN module in macaron style
+            self.norm_ff_macaron = nn.LayerNorm(embed_dim)
+        if self.conv_module is not None:
+            self.norm_conv = nn.LayerNorm(embed_dim)  # for the CNN module
+            self.norm_final = nn.LayerNorm(embed_dim)  # for the final output of the block
+        self.dropout = nn.Dropout(0.1)
+        self.embed_dim = embed_dim
+        self.normalize_before = normalize_before
+        self.concat_after = concat_after
+        if self.concat_after:
+            self.concat_linear = nn.Linear(embed_dim + embed_dim, embed_dim)
+        
+
+    def forward(
+        self,
+        x: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        position_bias: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Args:
+            x (Tensor): Input of shape `(batch, seq_length, embed_dim)`.
+            attention_mask (Optional[Tensor]): Attention mask.
+            position_bias (Optional[Tensor]): Position bias (only for some models).
+            key_padding_mask (Optional[Tensor]): Key padding mask (optional).
+
+        Returns:
+            Tuple[Tensor, Optional[Tensor]]: Output tensor and position bias.
+        """
+        if self.macaron_style:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_ff_macaron(x)
+            x = residual + self.ff_scale * self.dropout(self.feed_forward_macaron(x))
+            if not self.normalize_before:
+                x = self.norm_ff_macaron(x)
+                
+        # Multi-Head Self-Attention
+        if self.normalize_before:
+            x = self.norm_mha(x)
+        if self.self_attn is not None:
+            residual = x
+            # if self.layer_norm_first:
+            #     x = self.layer_norm(x)
+            x_attn, position_bias = self.self_attn(
+                x, attention_mask=attention_mask, position_bias=position_bias, key_padding_mask=key_padding_mask
+            )
+
+            x = self.dropout(x)
+        if self.concat_after:
+            x_concat = torch.cat((x, x_attn), dim=-1)
+            x = residual + self.concat_linear(x_concat)
+        else:
+            x = residual + self.dropout(x_attn)
+        if not self.normalize_before:
+            x = self.norm_mha(x)
+
+        # Convolution Module
+        if self.conv_module is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_conv(x)
+            x = residual + self.dropout(self.conv_module(x))
+            if not self.normalize_before:
+                x = self.norm_conv(x)
+
+        # Feed-Forward Network
+        residual = x
+        if self.normalize_before:
+            x = self.norm_ff(x)
+        x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
+        if not self.normalize_before:
+            x = self.norm_ff(x)
+        if self.conv_module is not None:
+            x = self.norm_final(x)
+
+        return x, position_bias
+    
+    def get_num_params(self):
+        num_params = self.embed_dim * 2 * 2     # two layer norms
+        if self.self_attn is not None:
+            num_params += self.self_attn.get_num_params()
+        if self.feed_forward is not None:
+            num_params += self.feed_forward.get_num_params()
+        if self.conv_module is not None:
+            num_params += self.conv_module.get_num_params()
+        if self.macaron_style:
+            num_params += self.feed_forward.get_num_params()
+            # num_params += self.embed_dim * 2
+        return num_params
 
 
 class EncoderLayer(Module):
@@ -880,7 +1320,7 @@ class Transformer(Module):
         self.layer_norm_first = layer_norm_first
         self.layer_drop = layer_drop
         self.dropout = nn.Dropout(dropout)
-        self.layers = layers
+        self.layers = nn.ModuleList(layers)
 
     def _preprocess(self, x: Tensor):
         x = x + self.pos_conv_embed(x)
@@ -898,6 +1338,7 @@ class Transformer(Module):
         position_bias: Optional[Tensor] = None,
     ) -> Tensor:
         x = self._preprocess(x)
+        
         for layer in self.layers:
             if not (self.training and torch.rand(1).item() <= self.layer_drop):
                 x, position_bias = layer(x, attention_mask, position_bias=position_bias)
@@ -956,15 +1397,31 @@ class Transformer(Module):
 
 
 class Encoder(Module):
+    # def __init__(
+    #     self,
+    #     feature_projection: Module,
+    #     transformer: Module,
+    # ):
+    #     super().__init__()
+    #     self.feature_projection = feature_projection
+    #     self.transformer = transformer
     def __init__(
         self,
         feature_projection: Module,
-        transformer: Module,
+        encoder: Module,
+        middle_encoder: Optional[Module] = None,
+        decoder: Optional[Module] = None,
+        downsampling: Optional[Module] = None,
+        upsampling: Optional[Module] = None,
     ):
         super().__init__()
         self.feature_projection = feature_projection
-        self.transformer = transformer
-
+        self.transformer = encoder
+        self.middle_encoder = middle_encoder
+        self.decoder = decoder
+        self.downsample_modules = downsampling
+        self.upsample_modules = upsampling
+    
     def _preprocess(
         self,
         features: Tensor,
@@ -989,24 +1446,68 @@ class Encoder(Module):
         lengths: Optional[Tensor] = None,
     ) -> Tensor:
         x, mask = self._preprocess(features, lengths)
+        # x = self.transformer(x, attention_mask=mask)
         x = self.transformer(x, attention_mask=mask)
+        # if self.downsample_modules is not None:
+        #     x = self.downsample_modules(x)
+        # if self.middle_encoder is not None:
+        #     x = self.middle_encoder(x, attention_mask=mask)
+        # if self.upsample_modules is not None:
+        #     x = self.upsample_modules(x)
+        # if self.decoder is not None:
+        #     x = self.decoder(x, attention_mask=mask)
         return x
 
+    # def extract_features(
+    #     self,
+    #     features: Tensor,
+    #     lengths: Optional[Tensor] = None,
+    #     num_layers: Optional[int] = None,
+    # ) -> List[Tensor]:
+    #     x, masks = self._preprocess(features, lengths)
+    #     interm = []
+    #     if num_layers is None:
+    #     # 모든 레이어 출력 반환
+    #         interm += self.transformer.get_intermediate_outputs(x, attention_mask=masks)
+    #         if self.middle_encoder is not None:
+    #             interm += self.middle_encoder.get_intermediate_outputs(interm[-1], attention_mask=masks)
+    #         if self.decoder is not None:
+    #             interm += self.decoder.get_intermediate_outputs(interm[-1], attention_mask=masks)
+    #     else:
+    #         # 특정 레이어 출력 반환
+    #         if num_layers <= len(self.encoder.layers):
+    #             interm += self.transformer.get_intermediate_outputs(x, attention_mask=masks, num_layers=num_layers)
+    #         elif self.middle_encoder is not None and num_layers <= len(self.transformer.layers) + len(self.middle_encoder.layers):
+    #             encoder_outputs = self.transformer.get_intermediate_outputs(x, attention_mask=masks)
+    #             interm += encoder_outputs
+    #             middle_start = num_layers - len(encoder_outputs)
+    #             interm += self.middle_encoder.get_intermediate_outputs(encoder_outputs[-1], attention_mask=masks, num_layers=middle_start)
+    #         elif self.decoder is not None:
+    #             encoder_outputs = self.transformer.get_intermediate_outputs(x, attention_mask=masks)
+    #             middle_outputs = self.middle_encoder.get_intermediate_outputs(encoder_outputs[-1], attention_mask=masks)
+    #             interm += encoder_outputs
+    #             interm += middle_outputs
+    #             decoder_start = num_layers - len(encoder_outputs) - len(middle_outputs)
+    #             interm += self.decoder.get_intermediate_outputs(middle_outputs[-1], attention_mask=masks, num_layers=decoder_start)
+
+    #     return interm
+    
     def extract_features(
-        self,
-        features: Tensor,
-        lengths: Optional[Tensor] = None,
-        num_layers: Optional[int] = None,
-    ) -> List[Tensor]:
-        x, masks = self._preprocess(features, lengths)
-        interm = self.transformer.get_intermediate_outputs(x, attention_mask=masks, num_layers=num_layers)
-        return [x] + interm
+            self,
+            features: Tensor,
+            lengths: Optional[Tensor] = None,
+            num_layers: Optional[int] = None,
+        ) -> List[Tensor]:
+            x, masks = self._preprocess(features, lengths)
+            interm = self.transformer.get_intermediate_outputs(x, attention_mask=masks, num_layers=num_layers)
+            return [x] + interm
+    
     
     def get_num_params(self, in_features):
         """Calculate the current model size."""
         feature_projection_size = self.feature_projection.get_num_params(in_features)
-        transformer_size = self.transformer.get_num_params()
-        return feature_projection_size + transformer_size
+        encoder_size = self.transformer.get_num_params()
+        return feature_projection_size + encoder_size
     
     def prune(self, conv_out_index):
         """In-place pruning of submodules."""
@@ -1022,6 +1523,8 @@ def _get_feature_extractor(
     shapes: List[Tuple[int, int, int]],
     bias: bool,
     prune_conv_channels: bool = False,
+    resnet: bool = False,
+    modality: str = "audio",
 ) -> FeatureExtractor:
     """
     Args:
@@ -1066,37 +1569,44 @@ def _get_feature_extractor(
         raise ValueError("Invalid norm mode")
     blocks = []
     in_channels = 1
-    for i, (out_channels, kernel_size, stride) in enumerate(shapes):
-        normalization = None
-        if norm_mode == "group_norm" and i == 0:
-            normalization = nn.GroupNorm(
-                num_groups=out_channels,
-                num_channels=out_channels,
-                affine=True,
+    if not resnet:
+        for i, (out_channels, kernel_size, stride) in enumerate(shapes):
+            normalization = None
+            if norm_mode == "group_norm" and i == 0:
+                normalization = nn.GroupNorm(
+                    num_groups=out_channels,
+                    num_channels=out_channels,
+                    affine=True,
+                )
+            elif norm_mode == "layer_norm":
+                normalization = LayerNorm(
+                    normalized_shape=out_channels,
+                    elementwise_affine=True,
+                )
+            blocks.append(
+                ConvLayerBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    bias=bias,
+                    layer_norm=normalization,
+                    prune_conv_channels=prune_conv_channels,
+                )
             )
-        elif norm_mode == "layer_norm":
-            normalization = LayerNorm(
-                normalized_shape=out_channels,
-                elementwise_affine=True,
-            )
-        blocks.append(
-            ConvLayerBlock(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                bias=bias,
-                layer_norm=normalization,
-                prune_conv_channels=prune_conv_channels,
-            )
-        )
-        in_channels = out_channels
-    return FeatureExtractor(nn.ModuleList(blocks))
+            in_channels = out_channels
+        return FeatureExtractor(nn.ModuleList(blocks))
+    else:
+        if modality=="audio":
+            return Conv1dResNet(relu_type='prelu', a_upsample_ratio=1)
+        elif modality=="video":
+            return Conv3dResNet(relu_type='prelu')
 
 
 def _get_encoder(
     in_features: int,
     embed_dim: int,
+    encoder_in_features: int,
     dropout_input: float,
     pos_conv_kernel: int,
     pos_conv_groups: int,
@@ -1115,6 +1625,9 @@ def _get_encoder(
     prune_attention_layer: bool = False,
     prune_feed_forward_intermediate: bool = False,
     prune_feed_forward_layer: bool = False,
+    use_multiresolution: bool = False,
+    convmodule: bool = False,
+    modality: str = "audio",
 ) -> Encoder:
     """
     Args:
@@ -1238,12 +1751,102 @@ def _get_encoder(
           - Large
             https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/vox_960h.yaml#L54
     """
-    feature_projection = FeatureProjection(in_features, embed_dim, dropout_input)
+    feature_projection = FeatureProjection(in_features, embed_dim, dropout_input, modality)
     pos_conv = ConvolutionalPositionalEmbedding(embed_dim, pos_conv_kernel, pos_conv_groups)
 
     # Original impl
     # https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L768-L782
     encoder_layers = nn.ModuleList()
+    # if use_multiresolution:
+    #     middle_encoder_layers = nn.ModuleList()
+    #     decoder_layers = nn.ModuleList()
+    #     feed_forward = FeedForward(
+    #         io_features=embed_dim,
+    #         intermediate_features=4096,
+    #         intermediate_dropout=ff_interm_dropout,
+    #         output_dropout=dropout,
+    #         prune_intermediate=prune_feed_forward_intermediate,
+    #         prune_layer=prune_feed_forward_layer,
+    #     )
+    #     self_attn = SelfAttention(
+    #         embed_dim=embed_dim,
+    #         num_heads=16,
+    #         head_dim=head_dim,
+    #         dropout=attention_dropout,
+    #         prune_heads=prune_attention_heads,
+    #         prune_layer=prune_attention_layer,
+    #     )
+    #     for _ in range(num_layers//3):
+    #         encoder_layers.append(
+    #             EncoderLayer(
+    #                 attention=self_attn,
+    #                 dropout=dropout,
+    #                 layer_norm_first=layer_norm_first,
+    #                 feed_forward=feed_forward,
+    #                 embed_dim=embed_dim,
+    #             )
+    #         )
+    #     encoder = Transformer(
+    #         pos_conv_embed=pos_conv,
+    #         dropout=dropout,
+    #         layers=encoder_layers,
+    #         layer_norm_first=not layer_norm_first,
+    #         layer_drop=layer_drop,
+    #     )
+    #     downsample_modules = Downsampler(
+    #         in_channels=embed_dim,
+    #         out_channels=embed_dim,
+    #         kernel_size=7,
+    #         stride=2,
+    #         dropout=dropout,
+    #         prune_intermediate=prune_feed_forward_intermediate,
+    #         prune_layer=prune_feed_forward_layer,
+    #     )
+    #     for _ in range(num_layers//3):
+    #         middle_encoder_layers.append(
+    #             EncoderLayer(
+    #                 attention=self_attn,
+    #                 dropout=dropout,
+    #                 layer_norm_first=layer_norm_first,
+    #                 feed_forward=feed_forward,
+    #                 embed_dim=embed_dim,
+    #             )
+    #         )  
+    #     middle_encoder = Transformer(
+    #         pos_conv_embed=pos_conv,
+    #         dropout=dropout,
+    #         layers=middle_encoder_layers,
+    #         layer_norm_first=not layer_norm_first,
+    #         layer_drop=layer_drop,
+    #     )
+    #     upsample_modules = Upsampler(
+    #         in_channels=embed_dim,
+    #         out_channels=embed_dim,
+    #         kernel_size=7,
+    #         stride=2,
+    #         dropout=dropout,
+    #         prune_intermediate=prune_feed_forward_intermediate,
+    #         prune_layer=prune_feed_forward_layer,
+    #     )
+    #     for _ in range(num_layers//3):
+    #         decoder_layers.append(
+    #             EncoderLayer(
+    #                 attention=self_attn,
+    #                 dropout=dropout,
+    #                 layer_norm_first=layer_norm_first,
+    #                 feed_forward=feed_forward,
+    #                 embed_dim=embed_dim,
+    #             )
+    #         )
+    #     decoder = Transformer(
+    #         pos_conv_embed=pos_conv,
+    #         dropout=dropout,
+    #         layers=decoder_layers,
+    #         layer_norm_first=not layer_norm_first,
+    #         layer_drop=layer_drop,
+    #     )
+    #     return Encoder(feature_projection, encoder, middle_encoder, decoder, downsample_modules, upsample_modules)
+    # else:
     for idx in range(num_layers):
         if use_attention[idx]:
             attention = SelfAttention(
@@ -1265,17 +1868,36 @@ def _get_encoder(
                 prune_intermediate=prune_feed_forward_intermediate,
                 prune_layer=prune_feed_forward_layer,
             )
-        else:
-            feed_forward = None
+        # if convmodule:
+        conv_module = ConvModule(
+            embed_dim=embed_dim,
+            kernel_size=31,
+            dropout=dropout,
+            prune_layer=prune_feed_forward_layer,   
+        )
         encoder_layers.append(
-            EncoderLayer(
-                attention=attention,
-                dropout=dropout,
-                layer_norm_first=layer_norm_first,
-                feed_forward=feed_forward,
-                embed_dim=embed_dim,
+            ConformerLayer(
+                attention = attention,   # Multihead Self-Attention
+                dropout = attention_dropout,
+                layer_norm_first = layer_norm_first,
+                feed_forward = feed_forward,  # Feed Forward
+                conv_module = conv_module,  # Convolutional Module
+                embed_dim = embed_dim,
+                normalize_before = True,
+                concat_after = False,
+                macaron_style = True,
             )
         )
+        # else:
+        #     encoder_layers.append(
+        #         EncoderLayer(
+        #             attention=attention,
+        #             dropout=dropout,
+        #             layer_norm_first=layer_norm_first,
+        #             feed_forward=feed_forward,
+        #             embed_dim=embed_dim,
+        #         )
+        # )
     transformer = Transformer(
         pos_conv_embed=pos_conv,
         dropout=dropout,

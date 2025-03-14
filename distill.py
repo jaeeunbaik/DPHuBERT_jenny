@@ -8,14 +8,19 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
 from lightning_lite.utilities.rank_zero import _get_rank
 
 from lightning import (
     DistillModule,
     DistillLoss,
 )
+
 from wav2vec2.model import (
     wav2vec2_model,
+    hubert_large,
+    conformer_base,
+    vhubert_large,
 )
 
 _LG = logging.getLogger(f"{__name__}:{_get_rank()}")
@@ -25,13 +30,20 @@ def _init_layer_transform(module: nn.Linear):
     module.weight.data.copy_(torch.eye(len(module.weight)))
     module.bias.data.fill_(0)
 
+from pytorch_lightning.callbacks import ModelCheckpoint
+checkpoint_callback = ModelCheckpoint(
+    dirpath="checkpoints/",  # 모델 저장 디렉토리
+    filename="{epoch}-{step}-{train_loss:.2f}",  # 파일명 포맷
+    save_top_k=-1,  # 모든 체크포인트 저장
+    every_n_train_steps=100,  # 100 스텝마다 저장
+)
 
 def run_train(args):
     pl.seed_everything(2022)
 
     # Callbacks
     lr_monitor = LearningRateMonitor()  # log learning rates for all param groups
-    model_checkpoint = ModelCheckpoint(dirpath=args.exp_dir / "ckpts", verbose=True)   # only save the latest epoch
+    model_checkpoint = ModelCheckpoint(dirpath=args.exp_dir / "ckpts", filename="{epoch}-{step}-{train_loss:.2f}", save_top_k=-1, every_n_train_steps=1000)   # only save the latest epoch
     callbacks = [lr_monitor, model_checkpoint]
 
     trainer = pl.Trainer(
@@ -52,7 +64,10 @@ def run_train(args):
 
     # Create teacher model
     teacher_ckpt = torch.load(args.teacher_ckpt, map_location="cpu")
-    teacher_model = wav2vec2_model(**teacher_ckpt['config'])
+    if args.modality == "audio":
+        teacher_model = hubert_large(**teacher_ckpt['config'])
+    elif args.modality == "video":
+        teacher_model = vhubert_large(**teacher_ckpt['config'])
     _LG.info(f"Teacher model:\n{teacher_model}")
     teacher_result = teacher_model.load_state_dict(teacher_ckpt['state_dict'], strict=False)
     _LG.info(f"Load pretrained ckpt to teacher: missing {teacher_result.missing_keys}, unexpected {teacher_result.unexpected_keys}")
@@ -61,26 +76,70 @@ def run_train(args):
         p.requires_grad = False
     _LG.info("Freeze parameters of the teacher model by setting requires_grad=False")
     teacher_model.eval()
-    
-    # Create student model
-    student_ckpt = torch.load(args.student_ckpt, map_location="cpu")
-    pruning_units = args.pruning_units.split(",")
-    _LG.info(f"Pruning units: {pruning_units}")
-    student_config = student_ckpt['config']
-    student_config.update(
-        dict(
-            extractor_prune_conv_channels = "conv" in pruning_units,
-            encoder_prune_attention_heads = "head" in pruning_units,
-            encoder_prune_attention_layer = "attlayer" in pruning_units,
-            encoder_prune_feed_forward_intermediate = "interm" in pruning_units,
-            encoder_prune_feed_forward_layer = "ffnlayer" in pruning_units,
-        )
-    )
-    student_model = wav2vec2_model(**student_config)
-    _LG.info(f"Student model:\n{student_model}")
-    student_result = student_model.load_state_dict(student_ckpt['state_dict'], strict=False)
-    _LG.info(f"Load pretrained ckpt to student: missing {student_result.missing_keys}, unexpected {student_result.unexpected_keys}")
 
+    # Create student model
+    # if args.student_ckpt is not "None":
+    #     student_ckpt = torch.load(args.student_ckpt, map_location="cpu")
+    #     pruning_units = args.pruning_units.split(",")
+    #     _LG.info(f"Pruning units: {pruning_units}")
+    #     student_config = student_ckpt['config']
+    #     student_config.update(
+    #         dict(
+    #             extractor_prune_conv_channels = "conv" in pruning_units,
+    #             encoder_prune_attention_heads = "head" in pruning_units,
+    #             encoder_prune_attention_layer = "attlayer" in pruning_units,
+    #             encoder_prune_feed_forward_intermediate = "interm" in pruning_units,
+    #             encoder_prune_feed_forward_layer = "ffnlayer" in pruning_units,
+    #         )
+    #     )
+    #     # student_model = wav2vec2_model(**student_config)
+    #     # student_model = mrhubert_large(**student_config)
+    #     student_model = conformer_base(**student_config)
+    #     _LG.info(f"Student model:\n{student_model}")
+    #     student_result = student_model.load_state_dict(student_ckpt['state_dict'], strict=False)
+    #     _LG.info(f"Load pretrained ckpt to student: missing {student_result.missing_keys}, unexpected {student_result.unexpected_keys}")
+    # else:
+    num_layers = 3
+    student_config = dict(
+        extractor_conv_layer_config=[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] * 2,
+        # extractor_conv_layer_config=[(256, 10, 5)] + [(256, 3, 2)] * 6  + [(256, 2, 2)] * 3,
+        encoder_embed_dim=1024,
+        encoder_projection_dropout=0.1,
+        encoder_pos_conv_kernel=128,
+        encoder_pos_conv_groups=16,
+        encoder_num_layers=num_layers,
+        encoder_use_attention=[True] * num_layers,
+        encoder_use_feed_forward=[True] * num_layers,
+        encoder_num_heads=[16] * num_layers,
+        encoder_head_dim=64,
+        encoder_attention_dropout=0.1,
+        encoder_ff_interm_features=[4096] * num_layers,
+        encoder_ff_interm_dropout=0.0,
+        encoder_dropout=0.1,
+        encoder_layer_drop=0.1,
+        aux_num_out=None,
+        normalize_waveform=False,
+        extractor_prune_conv_channels=False,
+        encoder_prune_attention_heads=False,
+        encoder_prune_attention_layer=False,
+        encoder_prune_feed_forward_intermediate=False,
+        encoder_prune_feed_forward_layer=False,
+        modality=args.modality,
+    )
+    student_model = conformer_base(**student_config)
+    student_model = torch.compile(student_model)
+    if args.modality == 'audio':
+        pretrained_ckpt = torch.load("/home/hdd2/jenny/AVKD/pretrained/hubert-large-frontend.pth")['state_dict']
+        student_model.feature_extractor.load_state_dict(pretrained_ckpt, strict=False)
+        for param in student_model.feature_extractor.parameters():
+            param.requires_grad = False
+    elif args.modality == 'video':
+        pretrained_ckpt = torch.load("/home/hdd2/jenny/AVKD/pretrained/vhubert-large-frontend.pth")['state_dict']
+        student_model.feature_extractor.load_state_dict(pretrained_ckpt, strict=False)
+        for param in student_model.feature_extractor.parameters():
+            param.requires_grad = False
+        
+        
     # Create linear layers which transform student hiddens to teacher hiddens
     distill_layer_groups = [[int(l) for l in g.split(",")] for g in args.distill_layers.split(".")]
     _LG.info(f"Distill transformer layers: {distill_layer_groups}")
@@ -128,7 +187,7 @@ def run_train(args):
         weight_decay=args.weight_decay,
         warmup_updates=args.warmup_updates,
         max_updates=args.max_updates,
-        use_reg=True,
+        use_reg=False,
         reg_learning_rate=args.reg_learning_rate,
         target_sparsity=args.target_sparsity,
         sparsity_warmup_updates=args.sparsity_warmup_updates,
@@ -136,6 +195,7 @@ def run_train(args):
         train_subset=args.train_subset,
         seconds_per_batch=args.seconds_per_batch,
         num_workers=args.num_workers,
+        modality=args.modality,
     )
 
     trainer.fit(
@@ -143,6 +203,19 @@ def run_train(args):
         ckpt_path=args.resume_checkpoint,
     )
 
+def _random_init_weights(m):
+    """Custom random initialization."""
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
 
 def _parse_args():
     parser = ArgumentParser(
@@ -158,14 +231,14 @@ def _parse_args():
     )
     parser.add_argument(
         "--train_subset",
-        default="train100",
-        choices=["train100", "train960"],
+        default="train",
+        choices=["train"],
         type=str,
         help="The subset name for training. (Default: 'train100')",
     )
     parser.add_argument(
         "--seconds_per_batch",
-        default=87.5,
+        default=10,
         type=float,
         help="Number of seconds of audio in a mini-batch. (Default: 87.5)",
     )
@@ -259,7 +332,8 @@ def _parse_args():
     )
     parser.add_argument(
         "--student_ckpt",
-        default=pathlib.Path("pretrained_ckpts/hubert-base-ls960.pth"),
+        # default=pathlib.Path("pretrained_ckpts/hubert-base-ls960.pth"),
+        default=None,
         type=pathlib.Path,
         help="Path to the student model checkpoint (for initialization)."
     )
@@ -322,12 +396,18 @@ def _parse_args():
         help="Target sparsity."
     )
     parser.add_argument(
+        "--modality",
+        default="audio",
+        type=str,
+        help="Modality of the model."
+    )
+    parser.add_argument(
         "--sparsity_warmup_updates",
         default=5000,
         type=int,
         help="Warmup updates for the target sparsity."
     )
-    
+
     return parser.parse_args()
 
 

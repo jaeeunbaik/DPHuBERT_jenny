@@ -17,6 +17,13 @@ from dataset.audio_dataset import (
     CollateFnAudio,
     AudioDataset,
 )
+from dataset.video_dataset import (
+    BucketizeBatchSampler,
+    DistributedBatchSampler,
+    CollateFnVideo,
+    VideoDataset,
+    VideoTransform,
+)
 
 
 class LinearDecayLRScheduler(torch.optim.lr_scheduler._LRScheduler):
@@ -103,7 +110,7 @@ class DistillLoss(nn.Module):
             self.l1_loss = nn.L1Loss()
         if cos_weight != 0:
             self.cos_sim = nn.CosineSimilarity(dim=-1)
-    
+
     def __repr__(self) -> str:
         return "{}(l2={}, l1={}, {}_cos={})".format(
             self.__class__.__name__,
@@ -161,6 +168,7 @@ class DistillModule(pl.LightningModule):
         train_subset: str,
         seconds_per_batch: float,
         num_workers: int,
+        modality: str,
     ):
         super().__init__()
 
@@ -196,9 +204,13 @@ class DistillModule(pl.LightningModule):
         self.train_subset = train_subset
         self.seconds_per_batch = seconds_per_batch
         self.num_workers = num_workers
+        self.modality = modality
 
     def configure_optimizers(self):
-        main_params = [p for n, p in self.student_model.named_parameters() if "log_alpha" not in n]
+        for param in self.student_model.feature_extractor.parameters():
+            param.requires_grad = False
+    
+        main_params = [p for n, p in self.student_model.encoder.named_parameters() if "log_alpha" not in n]
         main_params.extend(list(self.distill_linear_projs.parameters()))
         pgs = [
             {
@@ -250,10 +262,12 @@ class DistillModule(pl.LightningModule):
             teacher_hiddens = torch.stack(
                 [teacher_hiddens[idx] for idx in self.distill_layers], dim=1
             )   # (batch, layer, time, feature)
-        
+
+        self.student_model.feature_extractor.eval()
         student_hiddens, student_lengths = self.student_model.extract_features(waveforms, lengths)
         new_student_hiddens = []
-        for idx, proj in zip(self.distill_layers, self.distill_linear_projs):
+        # for idx, proj in zip(self.distill_layers, self.distill_linear_projs):
+        for idx, proj in zip([0,1,2], self.distill_linear_projs):
             if self.distill_mode == "layer2layer":
                 new_student_hiddens.append(proj(student_hiddens[idx]))
             elif self.distill_mode == "predlayer":
@@ -261,7 +275,6 @@ class DistillModule(pl.LightningModule):
             else:
                 raise ValueError(f"Invalid distill mode: {self.distill_mode}")
         student_hiddens = torch.stack(new_student_hiddens, dim=1)   # (batch, layer, time, feature)
-
         loss_distill, (loss_mse, loss_l1, loss_cos) = self.distill_loss(student_hiddens, teacher_hiddens)
 
         if self.use_reg:
@@ -304,39 +317,75 @@ class DistillModule(pl.LightningModule):
         return loss
 
     def train_dataloader(self):
-        dataset = AudioDataset(self.tsv_dir, self.train_subset)
-        sampler = BucketizeBatchSampler(
-            dataset.len_list,
-            num_buckets=1000,
-            max_token_count=self.seconds_per_batch * 16000,
-            min_len=32000,
-            max_len=250000,
-            shuffle=False,
-        )
-        sampler = DistributedBatchSampler(sampler, shuffle=True)
-        sampler.set_epoch(self.current_epoch)
-        dataloader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            collate_fn=CollateFnAudio(pad=False, rand_crop=True),   # crop to the min length in a mini-batch
-            num_workers=self.num_workers,
-        )
+        if self.modality == "audio":
+            dataset = AudioDataset(self.tsv_dir, self.train_subset)
+            sampler = BucketizeBatchSampler(
+                dataset.len_list,
+                num_buckets=100,
+                max_token_count=self.seconds_per_batch * 16000,
+                min_len=32000,
+                max_len=250000,
+                shuffle=False,
+            )
+            sampler = DistributedBatchSampler(sampler, shuffle=True)
+            sampler.set_epoch(self.current_epoch)
+            dataloader = DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                collate_fn=CollateFnAudio(pad=False, rand_crop=True),   # crop to the min length in a mini-batch
+                num_workers=self.num_workers,
+            )
+        elif self.modality == "video":
+            dataset = VideoDataset(self.tsv_dir, self.train_subset)
+            sampler = BucketizeBatchSampler(
+                dataset.len_list,
+                num_buckets=10,
+                max_token_count=self.seconds_per_batch * 25,
+                min_len=50,
+                max_len=500,
+                shuffle=False,
+            )
+            sampler = DistributedBatchSampler(sampler, shuffle=True)
+            sampler.set_epoch(self.current_epoch)
+            dataloader = DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                collate_fn=CollateFnVideo(pad=False, rand_crop=True, subset='train'),   # crop to the min length in a mini-batch
+                num_workers=self.num_workers,
+            )
         return dataloader        
 
     def val_dataloader(self):
-        dataset = AudioDataset(self.tsv_dir, "valid")
-        sampler = BucketizeBatchSampler(
-            dataset.len_list,
-            num_buckets=1000,
-            max_token_count=self.seconds_per_batch * 16000,
-            min_len=32000,
-            max_len=250000,
-            shuffle=False,
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            collate_fn=CollateFnAudio(pad=False, rand_crop=True),
-            num_workers=self.num_workers,
-        )
+        if self.modality == "audio":
+            dataset = AudioDataset(self.tsv_dir, "valid")
+            sampler = BucketizeBatchSampler(
+                dataset.len_list,
+                num_buckets=100,
+                max_token_count=self.seconds_per_batch * 16000,
+                min_len=32000,
+                max_len=250000,
+                shuffle=False,
+            )
+            dataloader = DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                collate_fn=CollateFnAudio(pad=False, rand_crop=True),
+                num_workers=self.num_workers,
+            )
+        elif self.modality == "video":
+            dataset = VideoDataset(self.tsv_dir, "valid")
+            sampler = BucketizeBatchSampler(
+                dataset.len_list,
+                num_buckets=10,
+                max_token_count=self.seconds_per_batch * 25,
+                min_len=50,
+                max_len=500,
+                shuffle=False,
+            )
+            dataloader = DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                collate_fn=CollateFnVideo(pad=False, rand_crop=True, subset="val"),
+                num_workers=self.num_workers,
+            )
         return dataloader
