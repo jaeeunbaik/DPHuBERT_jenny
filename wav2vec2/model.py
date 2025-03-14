@@ -161,7 +161,7 @@ class Wav2Vec2Model(Module):
                 waveforms = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
             else:
                 waveforms = F.layer_norm(waveforms, waveforms.shape[-1:])
-
+        lengths = None
         x, lengths = self.feature_extractor(waveforms, lengths)
         x = self.encoder(x, lengths)
         if self.aux is not None:
@@ -183,6 +183,7 @@ def wav2vec2_model_original(
     extractor_conv_layer_config: Optional[List[Tuple[int, int, int]]],
     extractor_conv_bias: bool,
     encoder_embed_dim: int,
+    encoder_in_features: int,
     encoder_projection_dropout: float,
     encoder_pos_conv_kernel: int,
     encoder_pos_conv_groups: int,
@@ -204,6 +205,10 @@ def wav2vec2_model_original(
     encoder_prune_attention_layer: bool = False,
     encoder_prune_feed_forward_intermediate: bool = False,
     encoder_prune_feed_forward_layer: bool = False,
+    use_multiresolution: bool = False,
+    convmodule: bool = False,
+    resnet: bool = False,
+    modality: str = "audio",
 ) -> Wav2Vec2Model:
     """Builds custom :class:`~torchaudio.models.Wav2Vec2Model`.
 
@@ -328,14 +333,17 @@ def wav2vec2_model_original(
     """  # noqa: E501
     if extractor_conv_layer_config is None:
         extractor_conv_layer_config = [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] * 2
-
+    
     feature_extractor = components._get_feature_extractor(
         extractor_mode, extractor_conv_layer_config, extractor_conv_bias, 
         prune_conv_channels=extractor_prune_conv_channels,
+        resnet=resnet, modality=modality,
     )
     encoder = components._get_encoder(
-        in_features=extractor_conv_layer_config[-1][0],
+        # in_features=extractor_conv_layer_config[-1][0],
+        in_features=encoder_in_features,
         embed_dim=encoder_embed_dim,
+        encoder_in_features=encoder_in_features,
         dropout_input=encoder_projection_dropout,
         pos_conv_kernel=encoder_pos_conv_kernel,
         pos_conv_groups=encoder_pos_conv_groups,
@@ -354,12 +362,232 @@ def wav2vec2_model_original(
         prune_attention_layer=encoder_prune_attention_layer,
         prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
         prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=False,
+        convmodule=convmodule,
+        modality=modality,
     )
     aux = None
     if aux_num_out is not None:
         aux = torch.nn.Linear(in_features=encoder_embed_dim, out_features=aux_num_out)
     return Wav2Vec2Model(normalize_waveform, feature_extractor, encoder, aux)
 
+
+def conformer_base(
+    extractor_conv_layer_config: Optional[List[Tuple[int, int, int]]] = None,
+    encoder_embed_dim: int = 1024,
+    encoder_projection_dropout: float = 0.1,
+    encoder_pos_conv_kernel: int = 128,
+    encoder_pos_conv_groups: int = 16,
+    encoder_num_layers: int = 3,
+    encoder_use_attention: List[bool] = [True] * 3,
+    encoder_use_feed_forward: List[bool] = [True] * 3,
+    encoder_num_heads: List[int] = [16] * 3,
+    encoder_head_dim: int = 64,
+    encoder_attention_dropout: float = 0.1,
+    encoder_ff_interm_features: List[int] = [4096] * 3,
+    encoder_ff_interm_dropout: float = 0.1,
+    encoder_dropout: float = 0.1,
+    encoder_layer_drop: float = 0.1,
+    aux_num_out: Optional[int] = None,
+    normalize_waveform: bool = False,
+    extractor_prune_conv_channels: bool = False,
+    encoder_prune_attention_heads: bool = False,
+    encoder_prune_attention_layer: bool = False,
+    encoder_prune_feed_forward_intermediate: bool = False,
+    encoder_prune_feed_forward_layer: bool = False,
+    modality: str = "audio",
+) -> Wav2Vec2Model:
+    """Builds "base" :class:`HuBERT <torchaudio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
+
+    Args:
+        encoder_projection_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_attention_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_ff_interm_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_layer_drop (float):
+            See :py:func:`wav2vec2_model`.
+        aux_num_out (int or None, optional):
+            See :py:func:`wav2vec2_model`.
+
+    Returns:
+        Wav2Vec2Model:
+            The resulting model.
+    """  # noqa: E501
+    return wav2vec2_model(
+        extractor_mode="group_norm",
+        extractor_conv_layer_config=extractor_conv_layer_config,
+        extractor_conv_bias=False,
+        encoder_embed_dim=encoder_embed_dim,
+        encoder_in_features=encoder_embed_dim,
+        encoder_projection_dropout=encoder_projection_dropout,
+        encoder_pos_conv_kernel=128,
+        encoder_pos_conv_groups=16,
+        encoder_num_layers=encoder_num_layers,
+        encoder_use_attention=encoder_use_attention,
+        encoder_use_feed_forward=encoder_use_feed_forward,
+        encoder_num_heads=encoder_num_heads,
+        encoder_head_dim=encoder_head_dim,
+        encoder_attention_dropout=encoder_attention_dropout,
+        encoder_ff_interm_features=encoder_ff_interm_features,
+        encoder_ff_interm_dropout=encoder_ff_interm_dropout,
+        encoder_dropout=encoder_dropout,
+        encoder_layer_norm_first=True,
+        encoder_layer_drop=encoder_layer_drop,
+        aux_num_out=aux_num_out,
+        normalize_waveform=normalize_waveform,
+        extractor_prune_conv_channels=extractor_prune_conv_channels,
+        encoder_prune_attention_heads=encoder_prune_attention_heads,
+        encoder_prune_attention_layer=encoder_prune_attention_layer,
+        encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
+        encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=False,
+        convmodule=True,
+        resnet=True,
+        modality=modality,
+    )
+
+def vhubert_large(
+    encoder_projection_dropout: float = 0.0,
+    encoder_attention_dropout: float = 0.0,
+    encoder_ff_interm_dropout: float = 0.0,
+    encoder_dropout: float = 0.0,
+    encoder_layer_drop: float = 0.0,
+    aux_num_out: Optional[int] = None,
+    extractor_prune_conv_channels: bool = False,
+    encoder_prune_attention_heads: bool = False,
+    encoder_prune_attention_layer: bool = False,
+    encoder_prune_feed_forward_intermediate: bool = False,
+    encoder_prune_feed_forward_layer: bool = False,
+) -> Wav2Vec2Model:
+    """Builds "large" :class:`HuBERT <torchaudio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
+
+    Args:
+        encoder_projection_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_attention_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_ff_interm_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_layer_drop (float):
+            See :py:func:`wav2vec2_model`.
+        aux_num_out (int or None, optional):
+            See :py:func:`wav2vec2_model`.
+
+    Returns:
+        Wav2Vec2Model:
+            The resulting model.
+    """  # noqa: E501
+    return wav2vec2_model(
+        extractor_mode="layer_norm",
+        extractor_conv_layer_config=None,
+        extractor_conv_bias=False,
+        encoder_embed_dim=1024,
+        encoder_in_features=1024,
+        encoder_projection_dropout=encoder_projection_dropout,
+        encoder_pos_conv_kernel=128,
+        encoder_pos_conv_groups=16,
+        encoder_num_layers=24,
+        encoder_use_attention=[True] * 24,
+        encoder_use_feed_forward=[True] * 24,
+        encoder_num_heads=[16] * 24,
+        encoder_head_dim=64,
+        encoder_attention_dropout=encoder_attention_dropout,
+        encoder_ff_interm_features=[4096] * 24,
+        encoder_ff_interm_dropout=encoder_ff_interm_dropout,
+        encoder_dropout=encoder_dropout,
+        encoder_layer_norm_first=True,
+        encoder_layer_drop=encoder_layer_drop,
+        aux_num_out=aux_num_out,
+        normalize_waveform=False,
+        extractor_prune_conv_channels=extractor_prune_conv_channels,
+        encoder_prune_attention_heads=encoder_prune_attention_heads,
+        encoder_prune_attention_layer=encoder_prune_attention_layer,
+        encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
+        encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        convmodule=False,
+        resnet=True,
+        use_multiresolution=False,
+        modality="video",
+    )
+
+def mrhubert_large(
+    extractor_conv_layer_config: Optional[List[Tuple[int, int, int]]] = None,
+    encoder_embed_dim: int = 1024,
+    encoder_projection_dropout: float = 0.1,
+    encoder_pos_conv_kernel: int = 128,
+    encoder_pos_conv_groups: int = 16,
+    encoder_num_layers: int = 24,
+    encoder_use_attention: List[bool] = [True] * 24,
+    encoder_use_feed_forward: List[bool] = [True] * 24,
+    encoder_num_heads: List[int] = [16] * 24,
+    encoder_head_dim: int = 64,
+    encoder_attention_dropout: float = 0.1,
+    encoder_ff_interm_features: List[int] = [4096] * 24,
+    encoder_ff_interm_dropout: float = 0.1,
+    encoder_dropout: float = 0.1,
+    encoder_layer_drop: float = 0.1,
+    aux_num_out: Optional[int] = None,
+    normalize_waveform: bool = False,
+    extractor_prune_conv_channels: bool = False,
+    encoder_prune_attention_heads: bool = False,
+    encoder_prune_attention_layer: bool = False,
+    encoder_prune_feed_forward_intermediate: bool = False,
+    encoder_prune_feed_forward_layer: bool = False,
+) -> Wav2Vec2Model:
+    """Builds "base" :class:`~torchaudio.models.Wav2Vec2Model` from *wav2vec 2.0* :cite:`baevski2020wav2vec`
+
+    Args:
+        encoder_projection_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_attention_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_ff_interm_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_dropout (float):
+            See :py:func:`wav2vec2_model`.
+        encoder_layer_drop (float):
+            See :py:func:`wav2vec2_model`.
+        aux_num_out (int or None, optional):
+            See :py:func:`wav2vec2_model`.
+
+    Returns:
+        Wav2Vec2Model:
+            The resulting model.
+    """  # noqa: E501
+    return wav2vec2_model(
+        extractor_mode="group_norm",
+        extractor_conv_layer_config=None,
+        extractor_conv_bias=False,
+        encoder_embed_dim=1024,
+        encoder_projection_dropout=encoder_projection_dropout,
+        encoder_pos_conv_kernel=128,
+        encoder_pos_conv_groups=16,
+        encoder_num_layers=24,
+        encoder_use_attention=[True] * 24,
+        encoder_use_feed_forward=[True] * 24,
+        encoder_num_heads=16,
+        encoder_head_dim=64,
+        encoder_attention_dropout=encoder_attention_dropout,
+        encoder_ff_interm_features=4096,
+        encoder_ff_interm_dropout=encoder_ff_interm_dropout,
+        encoder_dropout=encoder_dropout,
+        encoder_layer_norm_first=False,
+        encoder_layer_drop=encoder_layer_drop,
+        aux_num_out=aux_num_out,
+        normalize_waveform=False,
+        extractor_prune_conv_channels=extractor_prune_conv_channels,
+        encoder_prune_attention_heads=encoder_prune_attention_heads,
+        encoder_prune_attention_layer=encoder_prune_attention_layer,
+        encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
+        encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=True,
+    )
 
 def wav2vec2_base(
     encoder_projection_dropout: float = 0.1,
@@ -416,6 +644,7 @@ def wav2vec2_base(
         encoder_prune_attention_layer=encoder_prune_attention_layer,
         encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
         encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=False,
     )
 
 
@@ -474,6 +703,7 @@ def wav2vec2_large(
         encoder_prune_attention_layer=encoder_prune_attention_layer,
         encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
         encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=False,
     )
 
 
@@ -532,6 +762,7 @@ def wav2vec2_large_lv60k(
         encoder_prune_attention_layer=encoder_prune_attention_layer,
         encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
         encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=False,
     )
 
 
@@ -593,6 +824,7 @@ def hubert_base(
         encoder_prune_attention_layer=encoder_prune_attention_layer,
         encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
         encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=False,
     )
 
 
@@ -634,23 +866,32 @@ def hubert_large(
         extractor_conv_layer_config=None,
         extractor_conv_bias=False,
         encoder_embed_dim=1024,
+        encoder_in_features=512,
         encoder_projection_dropout=encoder_projection_dropout,
         encoder_pos_conv_kernel=128,
         encoder_pos_conv_groups=16,
         encoder_num_layers=24,
-        encoder_num_heads=16,
+        encoder_use_attention=[True] * 24,
+        encoder_use_feed_forward=[True] * 24,
+        encoder_num_heads=[16] * 24,
+        encoder_head_dim=64,
         encoder_attention_dropout=encoder_attention_dropout,
-        encoder_ff_interm_features=4096,
+        encoder_ff_interm_features=[4096] * 24,
         encoder_ff_interm_dropout=encoder_ff_interm_dropout,
         encoder_dropout=encoder_dropout,
         encoder_layer_norm_first=True,
         encoder_layer_drop=encoder_layer_drop,
         aux_num_out=aux_num_out,
+        normalize_waveform=False,
         extractor_prune_conv_channels=extractor_prune_conv_channels,
         encoder_prune_attention_heads=encoder_prune_attention_heads,
         encoder_prune_attention_layer=encoder_prune_attention_layer,
         encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
         encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        convmodule=False,
+        resnet=True,
+        use_multiresolution=False,
+        modality="audio",
     )
 
 
@@ -709,6 +950,7 @@ def hubert_xlarge(
         encoder_prune_attention_layer=encoder_prune_attention_layer,
         encoder_prune_feed_forward_intermediate=encoder_prune_feed_forward_intermediate,
         encoder_prune_feed_forward_layer=encoder_prune_feed_forward_layer,
+        use_multiresolution=False,
     )
 
 
