@@ -163,6 +163,9 @@ cython_debug/
 data/
 exp/
 pretrained/
-
+*.png
+LICENSE
 # SLURM output
 slurm-*.out
+result.txt
+*.ckpt
